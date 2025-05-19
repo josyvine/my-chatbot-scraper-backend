@@ -1,18 +1,21 @@
 import asyncio
-import httpx
-from urllib.parse import urlparse, urljoin
+import httpx # For asynchronous HTTP requests
+from urllib.parse import urlparse, urljoin # For link normalization
 import re
 from typing import List, Dict, Any, Tuple, Optional, Set
 
-# Assuming config.py and content_utils.py are in the same directory or accessible in PYTHONPATH
-from .config import (
+# Assuming config.py and content_utils.py are in the same directory (or project root)
+# Changed from .config to config, .content_utils to content_utils
+from config import (
     VALID_SCRAPER_API_KEYS, 
     SCRAPER_API_TIMEOUT, 
     MIN_CONTENT_LENGTH_FOR_SUMMARY,
     DEFAULT_USER_AGENT,
-    MAX_CONCURRENT_SCRAPES # Used in main.py but relevant for context
+    MAX_CONCURRENT_SCRAPES,
+    DEFAULT_MAX_DEPTH_INTERNAL_SPIDER,
+    DEFAULT_MAX_LINKS_PER_PAGE_SPIDER
 )
-from .content_utils import (
+from content_utils import (
     get_main_content_from_html, 
     extract_relevant_internal_links,
     extract_shopping_product_details 
@@ -21,26 +24,30 @@ from .content_utils import (
 # For DuckDuckGo searches
 from duckduckgo_search import DDGS
 
-# To manage key rotation for parallel tasks more explicitly if needed, though httpx handles concurrency.
-# This index is for single URL scrapes to try and rotate through the pool over time.
+# Global index for round-robin key selection for single URL scrapes
+# This needs to be managed carefully if your server runs multiple worker processes (Gunicorn)
+# For simplicity in a single-process scenario or if Gunicorn workers are stateless for this:
 scraper_key_round_robin_index = 0
+# A lock might be needed if multiple gunicorn workers try to modify this concurrently,
+# or each worker could have its own index, or keys could be assigned more randomly.
+# For now, this simple round-robin will distribute across calls to the single worker for scrapeUrl.
 
 async def fetch_url_with_scraperapi(
     target_url: str, 
     api_key: str, 
-    output_format: str = "html", # "html" or "markdown"
+    output_format: str = "markdown", # Changed default to markdown
     render_js: bool = True,
     country_code: Optional[str] = None,
     retry_count: int = 0,
-    max_retries: int = 1 # Max retries for this specific key for transient errors
+    max_retries: int = 1 
 ) -> Dict[str, Any]:
     """
     Fetches a single URL using a specific ScraperAPI key.
-    Returns a dictionary: {'raw_response_text': str, 'status_code': int, 'error_message': str|None, 'final_url': str, 'key_used': str}
+    Returns a dictionary: {'raw_response_text': str, 'status_code': int, 'error_message': str|None, 'final_url': str, 'key_used': str, 'is_critical_error': bool}
     """
-    if not api_key or api_key.startswith("YOUR_SCRAPERAPI_KEY_"):
-        error_msg = f"Invalid/Placeholder ScraperAPI key used for {target_url}."
-        print(f"ERROR: {error_msg}")
+    if not api_key or api_key.startswith("YOUR_SCRAPERAPI_KEY_"): # Should be caught by VALID_SCRAPER_API_KEYS check earlier
+        error_msg = f"Internal Error: Invalid or placeholder ScraperAPI key passed to fetch_url_with_scraperapi for {target_url}."
+        print(f"CRITICAL SCRIPT ERROR: {error_msg}")
         return {'raw_response_text': None, 'status_code': 0, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
 
     params = {
@@ -50,142 +57,126 @@ async def fetch_url_with_scraperapi(
     }
     if output_format == "markdown":
         params['output_format'] = "markdown"
-    else: # Default to HTML for link extraction etc.
-        params['autoparse'] = "false" # Important for getting raw HTML
+    else: 
+        params['autoparse'] = "false" 
     
     if country_code:
         params['country_code'] = country_code
 
-    scraper_api_url = "https://api.scraperapi.com/"
-    
-    headers = {'User-Agent': DEFAULT_USER_AGENT} # Can add more headers if needed
+    scraper_api_url = "https://api.scraperapi.com/" # Use HTTPS
+    headers = {'User-Agent': DEFAULT_USER_AGENT}
 
     async with httpx.AsyncClient(timeout=SCRAPER_API_TIMEOUT + 10, follow_redirects=True) as client:
+        response_text_for_error = ""
         try:
-            # print(f"Attempting fetch: {target_url} with key ...{api_key[-4:]}, format: {output_format}, attempt: {retry_count + 1}")
+            # print(f"  Fetching: {target_url} with key ...{api_key[-4:]}, format: {output_format}, attempt: {retry_count + 1}")
             response = await client.get(scraper_api_url, params=params, headers=headers)
-            
-            # Log the actual URL ScraperAPI tried to fetch if available (useful for debugging redirects)
-            # ScraperAPI doesn't directly expose this in headers easily, but the final URL is on response.url
-            
-            final_url_from_response = str(response.url) # This would be the ScraperAPI URL itself
-                                                      # The true final URL of the target isn't directly available here
-                                                      # unless ScraperAPI returns it in a custom header or body.
+            response_text_for_error = await response.text() # Read text early for error reporting
 
             if response.status_code == 401:
-                error_msg = f"ScraperAPI key ...{api_key[-4:]} FAILED (401 Unauthorized) for {target_url}."
+                error_msg = f"ScraperAPI key ...{api_key[-4:]} FAILED (401 Unauthorized) for {target_url}. Response: {response_text_for_error[:200]}"
                 print(f"ERROR: {error_msg}")
-                return {'raw_response_text': await response.text(), 'status_code': response.status_code, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
+                return {'raw_response_text': response_text_for_error, 'status_code': response.status_code, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
             
             if response.status_code == 403:
-                error_msg = f"ScraperAPI request FORBIDDEN (403) for {target_url} with key ...{api_key[-4:]}."
+                error_msg = f"ScraperAPI request FORBIDDEN (403) for {target_url} with key ...{api_key[-4:]}. Response: {response_text_for_error[:200]}"
                 print(f"ERROR: {error_msg}")
-                return {'raw_response_text': await response.text(), 'status_code': response.status_code, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
+                return {'raw_response_text': response_text_for_error, 'status_code': response.status_code, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
 
-            if response.status_code in [429, 500, 502, 503, 504]: # Retryable errors
+            if response.status_code in [429, 500, 502, 503, 504]:
                 if retry_count < max_retries:
-                    retry_delay = (retry_count + 1) * 3 # seconds
+                    retry_delay = (retry_count + 1) * 3 
                     print(f"ScraperAPI returned {response.status_code} for {target_url} with key ...{api_key[-4:]}. Retrying in {retry_delay}s...")
                     await asyncio.sleep(retry_delay)
                     return await fetch_url_with_scraperapi(target_url, api_key, output_format, render_js, country_code, retry_count + 1, max_retries)
                 else:
-                    error_msg = f"Max retries ({max_retries}) reached for {target_url} with key ...{api_key[-4:]}. Last status: {response.status_code}."
+                    error_msg = f"Max retries ({max_retries}) reached for {target_url} with key ...{api_key[-4:]}. Last status: {response.status_code}. Response: {response_text_for_error[:200]}"
                     print(f"ERROR: {error_msg}")
-                    return {'raw_response_text': await response.text(), 'status_code': response.status_code, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
+                    return {'raw_response_text': response_text_for_error, 'status_code': response.status_code, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
 
-            response.raise_for_status() # For other 4xx/5xx client/server errors from ScraperAPI
+            response.raise_for_status() 
 
-            return {'raw_response_text': response.text, 'status_code': response.status_code, 'error_message': None, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': False}
+            return {'raw_response_text': response_text_for_error, 'status_code': response.status_code, 'error_message': None, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': False}
         
         except httpx.TimeoutException as e:
             error_msg = f"Timeout fetching {target_url} via ScraperAPI (key ...{api_key[-4:]}): {str(e)}"
-            print(f"ERROR: {error_msg}")
-            return {'raw_response_text': None, 'status_code': 0, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True if retry_count >=max_retries else False}
-        except httpx.RequestError as e:
-            error_msg = f"Network/RequestError for {target_url} via ScraperAPI (key ...{api_key[-4:]}): {str(e)}"
-            print(f"ERROR: {error_msg}")
-            # For some request errors, retrying might be valid if it's not a critical setup issue
             if retry_count < max_retries:
                 await asyncio.sleep((retry_count + 1) * 2)
                 return await fetch_url_with_scraperapi(target_url, api_key, output_format, render_js, country_code, retry_count + 1, max_retries)
+            print(f"ERROR: {error_msg}")
             return {'raw_response_text': None, 'status_code': 0, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
-        except Exception as e: # Catch-all for other unexpected errors
+        except httpx.RequestError as e: 
+            error_msg = f"Network/RequestError for {target_url} via ScraperAPI (key ...{api_key[-4:]}): {str(e)}"
+            if retry_count < max_retries: # Some request errors might be retryable
+                await asyncio.sleep((retry_count + 1) * 2)
+                return await fetch_url_with_scraperapi(target_url, api_key, output_format, render_js, country_code, retry_count + 1, max_retries)
+            print(f"ERROR: {error_msg}")
+            return {'raw_response_text': None, 'status_code': 0, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
+        except Exception as e: 
             error_msg = f"Unexpected error fetching {target_url} via ScraperAPI (key ...{api_key[-4:]}): {str(e)}"
             print(f"ERROR: {error_msg}")
             return {'raw_response_text': None, 'status_code': 0, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
-
 
 async def process_single_site_for_spider_crawl(
     base_url: str, 
     api_key: str, 
     original_query: str, 
     max_depth: int, 
-    max_links_to_crawl_per_site: int # Renamed for clarity
+    max_links_to_crawl_per_site: int 
 ) -> Dict[str, Any]:
-    """
-    Crawls a single base_url and its relevant internal links using a specific ScraperAPI key.
-    Primarily fetches HTML for link extraction and content processing.
-    """
     site_content_parts: List[str] = []
-    site_images: List[Dict[str, str]] = [] # Could store {'src': url, 'alt': text}
+    # site_images: List[Dict[str, str]] = [] # Implement if needed
     site_errors: List[str] = []
     visited_on_this_site: Set[str] = set()
     
-    queue: List[Tuple[str, int]] = [(base_url, 0)] # (url, depth)
-    
+    queue: List[Tuple[str, int]] = [(base_url, 0)]
     query_terms = [term.strip() for term in original_query.lower().split() if term.strip()] if original_query else []
-
     processed_page_count = 0
 
     while queue and processed_page_count < max_links_to_crawl_per_site:
         current_url, current_d = queue.pop(0)
         
-        if current_url in visited_on_this_site:
-            continue
-        if current_d > max_depth:
+        if current_url in visited_on_this_site or current_d > max_depth:
             continue
         
         visited_on_this_site.add(current_url)
         processed_page_count += 1
-        print(f"  Spidering: {current_url} (Depth: {current_d}, Total for site: {processed_page_count}/{max_links_to_crawl_per_site}) with key ...{api_key[-4:]}")
+        print(f"  Spidering: {current_url} (Depth: {current_d}, Page {processed_page_count}/{max_links_to_crawl_per_site} for this site) with key ...{api_key[-4:]}")
 
-        # Fetch HTML for link extraction AND content processing
-        fetch_result = await fetch_url_with_scraperapi(current_url, api_key, output_format="html")
+        # Fetch HTML for link extraction, then get Markdown for content from that HTML
+        fetch_html_result = await fetch_url_with_scraperapi(current_url, api_key, output_format="html")
 
-        if fetch_result['error_message']:
-            site_errors.append(f"Fetch error for {current_url} (Key ...{fetch_result['key_used'][-4:]}, Status {fetch_result['status_code']}): {fetch_result['error_message']}")
-            if fetch_result.get('is_critical_error'): # If key is bad (401/403) or persistent error, stop this site's crawl
+        if fetch_html_result['error_message']:
+            site_errors.append(f"Fetch HTML error for {current_url} (Key ...{fetch_html_result['key_used'][-4:]}, Status {fetch_html_result['status_code']}): {fetch_html_result['error_message']}")
+            if fetch_html_result.get('is_critical_error'):
                 print(f"    Critical error for key ...{api_key[-4:]} on {current_url}. Aborting crawl for this base_url.")
                 break 
-            continue # Try next URL in queue if not critical for this specific page
+            continue 
 
-        raw_html = fetch_result['raw_response_text']
+        raw_html = fetch_html_result['raw_response_text']
         if not raw_html:
-            site_errors.append(f"No HTML content received for {current_url} (Key ...{fetch_result['key_used'][-4:]})")
+            site_errors.append(f"No HTML content received for {current_url} (Key ...{fetch_html_result['key_used'][-4:]})")
             continue
+        
+        # Process HTML for main content (e.g., using Readability)
+        extracted_markdown_content = get_main_content_from_html(raw_html, current_url)
 
-        # Extract main content using readability-lxml
-        # content_utils.py should handle this
-        extracted_markdown = get_main_content_from_html(raw_html, current_url) 
-
-        if extracted_markdown and len(extracted_markdown) > MIN_CONTENT_LENGTH_FOR_SUMMARY / 2 :
-            site_content_parts.append(f"### Content from: {current_url}\n{extracted_markdown}")
+        if extracted_markdown_content and len(extracted_markdown_content) > MIN_CONTENT_LENGTH_FOR_SUMMARY / 3 :
+            site_content_parts.append(f"### Content from: {current_url}\n{extracted_markdown_content}")
         else:
-            # Log even if content is short or primarily an error message from readability
-            site_content_parts.append(f"### Low/No substantial content from: {current_url} (Readability output length: {len(extracted_markdown)})")
+            site_content_parts.append(f"### Low/No substantial content from: {current_url} (Text length: {len(extracted_markdown_content)})")
 
-        # Link extraction for deeper crawl (if current_d < max_depth)
-        if current_d < max_depth:
+        if current_d < max_depth: # Only find new links if not at max depth for this branch
             internal_links = extract_relevant_internal_links(raw_html, current_url, query_terms, DEFAULT_MAX_LINKS_PER_PAGE_SPIDER)
             for link in internal_links:
-                if len(visited_on_this_site) + len(queue) < max_links_to_crawl_per_site * 1.5: # Control queue size
+                if len(visited_on_this_site) + len(queue) < max_links_to_crawl_per_site * 1.5: # Control queue expansion
                     if link not in visited_on_this_site and not any(q_item[0] == link for q_item in queue):
                         queue.append((link, current_d + 1))
     
     return {
         "source_base_url": base_url,
         "aggregated_content": "\n\n---\n\n".join(site_content_parts) if site_content_parts else f"No content gathered from {base_url} or its subpages.",
-        "images": site_images, # Implement image extraction in content_utils if needed
+        "images": [], # Placeholder - image extraction logic to be added in content_utils if needed
         "errors": site_errors,
         "key_used_for_base": api_key
     }
@@ -196,23 +187,14 @@ async def process_spider_crawl_batch_endpoint_logic(query: str, base_urls: List[
 
     tasks = []
     num_valid_keys = len(VALID_SCRAPER_API_KEYS)
+    urls_to_process_in_parallel = base_urls[:min(len(base_urls), num_valid_keys, MAX_CONCURRENT_SCRAPES)]
     
-    # Determine how many URLs to process in parallel based on available keys and concurrency limit
-    urls_to_process_count = min(len(base_urls), num_valid_keys, MAX_CONCURRENT_SCRAPES)
-    
-    key_assignment_index = 0
-    for i in range(urls_to_process_count):
-        base_url_to_process = base_urls[i]
-        api_key_to_use = VALID_SCRAPER_API_KEYS[key_assignment_index % num_valid_keys]
-        key_assignment_index += 1
-        
+    # Assign keys to parallel tasks
+    for i, base_url_to_process in enumerate(urls_to_process_in_parallel):
+        api_key_to_use = VALID_SCRAPER_API_KEYS[i % num_valid_keys] # Simple round robin for the initial batch
         tasks.append(
             process_single_site_for_spider_crawl(
-                base_url_to_process, 
-                api_key_to_use, 
-                query, 
-                max_depth_internal, 
-                max_links_per_url
+                base_url_to_process, api_key_to_use, query, max_depth_internal, max_links_per_url
             )
         )
     
@@ -220,55 +202,43 @@ async def process_spider_crawl_batch_endpoint_logic(query: str, base_urls: List[
     
     final_aggregated_content_parts = []
     all_errors_reported = []
-    # all_images_combined = [] # If you implement image extraction
 
     for i, res_or_exc in enumerate(results):
-        processed_url = base_urls[i] # Assuming results are in order
+        processed_url = urls_to_process_in_parallel[i]
         if isinstance(res_or_exc, Exception):
             err_msg = f"Task for {processed_url} failed with unhandled exception: {str(res_or_exc)}"
-            print(f"ERROR: {err_msg}")
             all_errors_reported.append(err_msg)
             final_aggregated_content_parts.append(f"### Major error processing {processed_url}\n{str(res_or_exc)}")
-        elif res_or_exc: # It's a dictionary result
+        elif res_or_exc:
             if res_or_exc.get("aggregated_content"):
                 final_aggregated_content_parts.append(res_or_exc["aggregated_content"])
             if res_or_exc.get("errors"):
                 all_errors_reported.extend(res_or_exc["errors"])
-            # if res_or_exc.get("images"): all_images_combined.extend(res_or_exc["images"])
-
-    content_str = "\n\n".join(final_aggregated_content_parts)
     
-    # Filter out placeholder/error messages from the final aggregation
-    # This regex needs to be robust to catch various forms of failure messages
+    content_str = "\n\n".join(final_aggregated_content_parts)
+    meaningful_content_str = content_str # Start with all, then filter
+    
+    # Filter out placeholder/error messages
     filter_patterns = [
-        r"### (Low/No substantial content|No content gathered from|Fetch error for|Major error processing|Status for) [^\n]+.*?\n?",
+        r"### (Low/No substantial content|No content gathered from|Fetch Error for|Major error processing|Status for|System Error processing) from [^\n]+.*?\n?",
         r"ScraperAPI key .*? (is invalid/unauthorized|FAILED|was Forbidden).*?\n?",
         r"Max retries reached for key .*?\n?",
         r"Failed to fetch/process content from .*? after all attempts:.*?\n?",
-        r"Failed to fetch .*?: Invalid or placeholder ScraperAPI key.*?\n?"
+        r"Failed to fetch .*?: Invalid or placeholder ScraperAPI key.*?\n?",
+        r"No substantial content extracted from [^\n]+\. \(R\.len: \d+, B\.len: \d+\).*?\n?",
+        r"No meaningful content extracted by Readability, and no body text found for [^\n]+\..*?\n?"
     ]
-    
-    meaningful_content_str = content_str
     for pattern in filter_patterns:
         meaningful_content_str = re.sub(pattern, "", meaningful_content_str, flags=re.IGNORECASE | re.MULTILINE).strip()
     
-    print(f"process_spider_crawl_batch_endpoint_logic: Original aggregated length: {len(content_str)}, Filtered length: {len(meaningful_content_str)}")
-
     if not meaningful_content_str or len(meaningful_content_str) < MIN_CONTENT_LENGTH_FOR_SUMMARY:
          final_report = "After attempting to scrape, no substantial content was found to summarize."
          if all_errors_reported:
-             final_report += " Encountered issues (see system messages/console for details). Please ensure ScraperAPI keys are valid and sites are accessible."
-         return {
-            "aggregated_content": final_report,
-            "all_errors": all_errors_reported
-            # "images_to_summarize": []
-        }
+             final_report += f" Encountered issues (Total: {len(all_errors_reported)}). Please check server console for ScraperAPI key errors (401/403) or site blocking issues."
+         return {"aggregated_content": final_report, "all_errors": all_errors_reported}
 
-    return {
-        "aggregated_content": meaningful_content_str,
-        "all_errors": all_errors_reported
-        # "images_to_summarize": select_relevant_images(all_images_combined, query, 2) # Placeholder for image selection logic
-    }
+    return {"aggregated_content": meaningful_content_str, "all_errors": all_errors_reported}
+
 
 async def process_duckduckgo_search_and_scrape_endpoint_logic(query: str, num_results: int):
     if not VALID_SCRAPER_API_KEYS:
@@ -277,9 +247,9 @@ async def process_duckduckgo_search_and_scrape_endpoint_logic(query: str, num_re
     print(f"Performing DuckDuckGo search for: '{query}'")
     ddg_search_results: List[Dict[str, str]] = []
     try:
-        with DDGS(timeout=20) as ddgs: # DDGS can be slow
+        with DDGS(timeout=20) as ddgs:
             for r in ddgs.text(query, max_results=num_results):
-                if r.get('href'): # Ensure URL exists
+                if r.get('href'):
                     ddg_search_results.append({"url": r['href'], "title": r.get('title', 'No Title'), "snippet": r.get('body', '')})
     except Exception as e:
         error_msg = f"DuckDuckGo search failed: {e}"
@@ -291,17 +261,15 @@ async def process_duckduckgo_search_and_scrape_endpoint_logic(query: str, num_re
 
     tasks = []
     num_valid_keys = len(VALID_SCRAPER_API_KEYS)
-    global current_key_index_for_parallel # Re-initialize or manage for each request batch
-    current_key_index_for_parallel = 0
+    global scraper_key_round_robin_index # Use the global round-robin for assigning keys to DDG result scrapes
 
-    # Limit parallel tasks
-    urls_to_process_count = min(len(ddg_search_results), num_valid_keys, MAX_CONCURRENT_SCRAPES)
+    urls_to_process_count = min(len(ddg_search_results), MAX_CONCURRENT_SCRAPES) # Limit concurrency for DDG results
     
     for i in range(urls_to_process_count):
         target_url_info = ddg_search_results[i]
-        api_key_to_use = VALID_SCRAPER_API_KEYS[current_key_index_for_parallel % num_valid_keys]
-        current_key_index_for_parallel += 1
-        # For DDG results, directly request Markdown from ScraperAPI for simplicity and potentially better results
+        api_key_to_use = VALID_SCRAPER_API_KEYS[scraper_key_round_robin_index % num_valid_keys]
+        scraper_key_round_robin_index = (scraper_key_round_robin_index + 1) % num_valid_keys
+        # Request Markdown directly for DDG results for simplicity
         tasks.append(fetch_url_with_scraperapi(target_url_info['url'], api_key_to_use, output_format="markdown"))
     
     scraped_page_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -316,34 +284,37 @@ async def process_duckduckgo_search_and_scrape_endpoint_logic(query: str, num_re
             err_msg = f"Task failed for {source_info['url']}: {str(res_or_exc)}"
             all_errors_reported.append(err_msg)
             print(f"ERROR: {err_msg}")
-        elif res_or_exc: # It's a dictionary from fetch_url_with_scraperapi
+        elif res_or_exc:
             if res_or_exc['error_message']:
                 err_msg = f"Error fetching {source_info['url']} (Key ...{res_or_exc['key_used'][-4:]}, Status {res_or_exc['status_code']}): {res_or_exc['error_message']}"
                 all_errors_reported.append(err_msg)
-                print(f"ERROR: {err_msg}")
-            # Check if raw_response_text (which is markdown here) is substantial
             elif res_or_exc['raw_response_text'] and len(res_or_exc['raw_response_text']) > MIN_CONTENT_LENGTH_FOR_SUMMARY / 2: 
                 final_aggregated_content_parts.append(f"### Content from: {source_info['title']} ({source_info['url']})\n{res_or_exc['raw_response_text']}")
                 processed_sources.append({"title": source_info['title'], "url": source_info['url']})
             else:
                  all_errors_reported.append(f"Low/No content from {source_info['url']} (Key ...{res_or_exc['key_used'][-4:]}, Status {res_or_exc['status_code']}). Markdown length: {len(res_or_exc['raw_response_text'] or '')}")
 
-
     content_str = "\n\n---\n\n".join(final_aggregated_content_parts)
-    filter_patterns = [ /* ... as defined in previous function ... */ ] 
+    meaningful_content_str = content_str
+    filter_patterns = [ /* ... (same as in process_spider_crawl_batch_endpoint_logic) ... */ 
+        r"### (Low/No substantial content|No content gathered from|Fetch Error for|Major error processing|Status for|System Error processing) from [^\n]+.*?\n?",
+        r"ScraperAPI key .*? (is invalid/unauthorized|FAILED|was Forbidden).*?\n?",
+        r"Max retries reached for key .*?\n?",
+        r"Failed to fetch/process content from .*? after all attempts:.*?\n?",
+        r"Failed to fetch .*?: Invalid or placeholder ScraperAPI key.*?\n?",
+        r"No substantial content extracted from [^\n]+\. \(R\.len: \d+, B\.len: \d+\).*?\n?",
+        r"No meaningful content extracted by Readability, and no body text found for [^\n]+\..*?\n?"
+    ]
     for pattern in filter_patterns:
-        content_str = re.sub(pattern, "", content_str, flags=re.IGNORECASE | re.MULTILINE)
-    meaningful_content_str = content_str.strip()
-
-    print(f"process_duckduckgo_search: Original aggregated length: {len(content_str)}, Filtered length: {len(meaningful_content_str)}")
-
+        meaningful_content_str = re.sub(pattern, "", meaningful_content_str, flags=re.IGNORECASE | re.MULTILINE).strip()
+    
     if not meaningful_content_str or len(meaningful_content_str) < MIN_CONTENT_LENGTH_FOR_SUMMARY:
         final_report = "After fetching DuckDuckGo results, no substantial content was extracted to provide a meaningful summary."
         if all_errors_reported:
-             final_report += " Encountered issues (see system messages/console for details). Please ensure ScraperAPI keys are valid and sites are accessible."
+             final_report += f" Encountered issues (Total: {len(all_errors_reported)}). Please check server console for ScraperAPI key errors or site blocking."
         return {
             "aggregated_search_content": final_report,
-            "sources": processed_sources, # Still return sources even if content is low
+            "sources": processed_sources,
             "all_errors": all_errors_reported
         }
 
