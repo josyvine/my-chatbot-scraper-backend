@@ -1,7 +1,15 @@
 fastapi
+
 uvicorn[standard]
+
+gunicorn            
+
 httpx[http2]
+
 beautifulsoup4
+
 readability-lxml
+
 duckduckgo_search
+
 python-dotenv
