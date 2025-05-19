@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl, Field 
 from typing import List, Optional, Any, Dict
 
-# Direct imports for modules in the same directory
+# Corrected: Direct imports for modules in the same directory
 from scraper_service import (
     process_spider_crawl_batch_endpoint_logic, 
     process_duckduckgo_search_and_scrape_endpoint_logic
@@ -12,13 +12,14 @@ from config import (
     DEFAULT_MAX_DEPTH_INTERNAL_SPIDER, 
     DEFAULT_MAX_LINKS_PER_PAGE_SPIDER,
     MAX_DUCKDUCKGO_RESULTS_TO_PROCESS,
-    VALID_SCRAPER_API_KEYS 
+    VALID_SCRAPER_API_KEYS,
+    MAX_CONCURRENT_SCRAPES # Ensure this is available for startup log
 )
 
 app = FastAPI(
     title="Chatbot Scraper Backend API",
     description="Handles web scraping tasks for the chatbot, using ScraperAPI and other tools.",
-    version="1.0.3" # Incremented version
+    version="1.0.4" # Incremented version
 )
 
 app.add_middleware(
@@ -56,6 +57,7 @@ async def startup_event():
     if not VALID_SCRAPER_API_KEYS:
         print("FATAL: Application starting without any valid ScraperAPI keys. Scraping endpoints will likely fail or use insecure fallbacks.")
     else:
+        # MAX_CONCURRENT_SCRAPES is defined in config.py and imported
         print(f"FastAPI application startup complete. {len(VALID_SCRAPER_API_KEYS)} ScraperAPI key(s) loaded. MAX_CONCURRENT_SCRAPES set to {MAX_CONCURRENT_SCRAPES}.")
     print(f"Default internal crawl depth: {DEFAULT_MAX_DEPTH_INTERNAL_SPIDER}, max links per page: {DEFAULT_MAX_LINKS_PER_PAGE_SPIDER}")
 
@@ -64,7 +66,7 @@ async def api_spider_crawl_batch(request_data: SpiderCrawlRequest, request: Requ
     client_host = request.client.host if request.client else "unknown"
     print(f"Received /api/spider-crawl-batch request from {client_host} for query: '{request_data.query}' with {len(request_data.base_urls)} base URLs.")
 
-    if not VALID_SCRAPER_API_KEYS:
+    if not VALID_SCRAPER_API_KEYS: # Check if any valid keys are loaded
         raise HTTPException(status_code=503, detail="Server configuration error: No valid ScraperAPI keys available. Please check server logs and environment variables.")
 
     try:
@@ -76,7 +78,7 @@ async def api_spider_crawl_batch(request_data: SpiderCrawlRequest, request: Requ
             request_data.max_depth_internal,
             request_data.max_links_per_url
         )
-        return ScrapeResponse(**result) # Use the response model
+        return ScrapeResponse(**result) 
     except Exception as e:
         print(f"Unhandled error in /api/spider-crawl-batch endpoint for query '{request_data.query}': {type(e).__name__} - {e}")
         import traceback
@@ -96,7 +98,7 @@ async def api_duckduckgo_scrape(request_data: DuckDuckGoScrapeRequest, request: 
             request_data.query,
             request_data.num_results
         )
-        return DuckDuckGoScrapeResponse(**result) # Use the response model
+        return DuckDuckGoScrapeResponse(**result)
     except Exception as e:
         print(f"Unhandled error in /api/duckduckgo-scrape endpoint for query '{request_data.query}': {type(e).__name__} - {e}")
         import traceback
@@ -105,7 +107,4 @@ async def api_duckduckgo_scrape(request_data: DuckDuckGoScrapeRequest, request: 
 
 @app.get("/", include_in_schema=False) 
 async def read_root():
-    return {"message": "Chatbot Scraper API is running. See /docs for API documentation."}
-
-# To run locally (for development only - Render uses the Start Command):
-# uvicorn main:app --reload --port 8008 --host 0.0.0.0
+    return {"message": "Chatbot Scraper API is running. Version 1.0.4. See /docs for API documentation."}

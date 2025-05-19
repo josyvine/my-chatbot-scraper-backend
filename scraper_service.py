@@ -1,6 +1,6 @@
 import asyncio
-import httpx # For asynchronous HTTP requests
-from urllib.parse import urlparse, urljoin # For link normalization
+import httpx
+from urllib.parse import urlparse, urljoin
 import re
 from typing import List, Dict, Any, Tuple, Optional, Set
 
@@ -10,7 +10,7 @@ from config import (
     SCRAPER_API_TIMEOUT, 
     MIN_CONTENT_LENGTH_FOR_SUMMARY,
     DEFAULT_USER_AGENT,
-    MAX_CONCURRENT_SCRAPES,
+    MAX_CONCURRENT_SCRAPES, # Ensure this is imported
     DEFAULT_MAX_DEPTH_INTERNAL_SPIDER,
     DEFAULT_MAX_LINKS_PER_PAGE_SPIDER
 )
@@ -20,7 +20,6 @@ from content_utils import (
     extract_shopping_product_details 
 )
 
-# For DuckDuckGo searches
 from duckduckgo_search import DDGS
 
 scraper_key_round_robin_index = 0
@@ -48,7 +47,7 @@ async def fetch_url_with_scraperapi(
         params['output_format'] = "markdown"
     else: 
         params['autoparse'] = "false" 
-    
+
     if country_code:
         params['country_code'] = country_code
 
@@ -65,7 +64,7 @@ async def fetch_url_with_scraperapi(
                 error_msg = f"ScraperAPI key ...{api_key[-4:]} FAILED (401 Unauthorized) for {target_url}. Response: {response_text_for_error[:200]}"
                 print(f"ERROR: {error_msg}")
                 return {'raw_response_text': response_text_for_error, 'status_code': response.status_code, 'error_message': error_msg, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': True}
-            
+
             if response.status_code == 403:
                 error_msg = f"ScraperAPI request FORBIDDEN (403) for {target_url} with key ...{api_key[-4:]}. Response: {response_text_for_error[:200]}"
                 print(f"ERROR: {error_msg}")
@@ -85,7 +84,7 @@ async def fetch_url_with_scraperapi(
             response.raise_for_status() 
 
             return {'raw_response_text': response_text_for_error, 'status_code': response.status_code, 'error_message': None, 'final_url': target_url, 'key_used': api_key, 'is_critical_error': False}
-        
+
         except httpx.TimeoutException as e:
             error_msg = f"Timeout fetching {target_url} via ScraperAPI (key ...{api_key[-4:]}): {str(e)}"
             if retry_count < max_retries:
@@ -116,17 +115,17 @@ async def process_single_site_for_spider_crawl(
     site_images: List[Dict[str, str]] = []
     site_errors: List[str] = []
     visited_on_this_site: Set[str] = set()
-    
+
     queue: List[Tuple[str, int]] = [(base_url, 0)]
     query_terms = [term.strip() for term in original_query.lower().split() if term.strip()] if original_query else []
     processed_page_count = 0
 
     while queue and processed_page_count < max_links_to_crawl_per_site:
         current_url, current_d = queue.pop(0)
-        
+
         if current_url in visited_on_this_site or current_d > max_depth:
             continue
-        
+
         visited_on_this_site.add(current_url)
         processed_page_count += 1
         print(f"  Spidering: {current_url} (Depth: {current_d}, Page {processed_page_count}/{max_links_to_crawl_per_site} for this site) with key ...{api_key[-4:]}")
@@ -144,7 +143,7 @@ async def process_single_site_for_spider_crawl(
         if not raw_html:
             site_errors.append(f"No HTML content received for {current_url} (Key ...{fetch_html_result['key_used'][-4:]})")
             continue
-        
+
         extracted_markdown_content = get_main_content_from_html(raw_html, current_url) 
 
         if extracted_markdown_content and len(extracted_markdown_content) > MIN_CONTENT_LENGTH_FOR_SUMMARY / 3 :
@@ -158,7 +157,7 @@ async def process_single_site_for_spider_crawl(
                 if len(visited_on_this_site) + len(queue) < max_links_to_crawl_per_site * 1.5: 
                     if link not in visited_on_this_site and not any(q_item[0] == link for q_item in queue):
                         queue.append((link, current_d + 1))
-    
+
     return {
         "source_base_url": base_url,
         "aggregated_content": "\n\n---\n\n".join(site_content_parts) if site_content_parts else f"No content gathered from {base_url} or its subpages.",
@@ -173,21 +172,22 @@ async def process_spider_crawl_batch_endpoint_logic(query: str, base_urls: List[
 
     tasks = []
     num_valid_keys = len(VALID_SCRAPER_API_KEYS)
+    # Use MAX_CONCURRENT_SCRAPES from config here
     urls_to_process_in_parallel = base_urls[:min(len(base_urls), num_valid_keys, MAX_CONCURRENT_SCRAPES)]
-    
+
     key_assignment_index = 0 
     for i, base_url_to_process in enumerate(urls_to_process_in_parallel):
         api_key_to_use = VALID_SCRAPER_API_KEYS[key_assignment_index % num_valid_keys]
         key_assignment_index += 1
-        
+
         tasks.append(
             process_single_site_for_spider_crawl(
                 base_url_to_process, api_key_to_use, query, max_depth_internal, max_links_per_url
             )
         )
-    
+
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     final_aggregated_content_parts = []
     all_errors_reported = []
 
@@ -202,10 +202,10 @@ async def process_spider_crawl_batch_endpoint_logic(query: str, base_urls: List[
                 final_aggregated_content_parts.append(res_or_exc["aggregated_content"])
             if res_or_exc.get("errors"):
                 all_errors_reported.extend(res_or_exc["errors"])
-    
+
     content_str = "\n\n".join(final_aggregated_content_parts)
     meaningful_content_str = content_str 
-    
+
     filter_patterns = [
         r"### (Low/No substantial content|No content gathered from|Fetch HTML error for|Fetch error for|Major error processing|Status for|System Error processing) from [^\n]+.*?\n?",
         r"ScraperAPI key .*? (is invalid/unauthorized|FAILED|was Forbidden).*?\n?",
@@ -218,7 +218,7 @@ async def process_spider_crawl_batch_endpoint_logic(query: str, base_urls: List[
     ]
     for pattern in filter_patterns:
         meaningful_content_str = re.sub(pattern, "", meaningful_content_str, flags=re.IGNORECASE | re.MULTILINE).strip()
-    
+
     if not meaningful_content_str or len(meaningful_content_str) < MIN_CONTENT_LENGTH_FOR_SUMMARY:
          final_report = "After attempting to scrape, no substantial content was found to summarize."
          if all_errors_reported:
@@ -249,15 +249,16 @@ async def process_duckduckgo_search_and_scrape_endpoint_logic(query: str, num_re
     tasks = []
     num_valid_keys = len(VALID_SCRAPER_API_KEYS)
     global scraper_key_round_robin_index 
-    
+
+    # Use MAX_CONCURRENT_SCRAPES from config here
     urls_to_process_count = min(len(ddg_search_results), MAX_CONCURRENT_SCRAPES, num_valid_keys)
-    
+
     for i in range(urls_to_process_count):
         target_url_info = ddg_search_results[i]
         api_key_to_use = VALID_SCRAPER_API_KEYS[scraper_key_round_robin_index % num_valid_keys]
         scraper_key_round_robin_index = (scraper_key_round_robin_index + 1) % num_valid_keys
         tasks.append(fetch_url_with_scraperapi(target_url_info['url'], api_key_to_use, output_format="markdown"))
-    
+
     scraped_page_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     final_aggregated_content_parts = []
@@ -282,8 +283,7 @@ async def process_duckduckgo_search_and_scrape_endpoint_logic(query: str, num_re
 
     content_str = "\n\n---\n\n".join(final_aggregated_content_parts)
     meaningful_content_str = content_str
-    
-    # *** CORRECTED filter_patterns HERE ***
+
     filter_patterns = [
         r"### (Low/No substantial content|No content gathered from|Fetch HTML error for|Fetch error for|Major error processing|Status for|System Error processing) from [^\n]+.*?\n?",
         r"ScraperAPI key .*? (is invalid/unauthorized|FAILED|was Forbidden).*?\n?",
@@ -296,7 +296,7 @@ async def process_duckduckgo_search_and_scrape_endpoint_logic(query: str, num_re
     ]
     for pattern in filter_patterns:
         meaningful_content_str = re.sub(pattern, "", meaningful_content_str, flags=re.IGNORECASE | re.MULTILINE).strip()
-    
+
     if not meaningful_content_str or len(meaningful_content_str) < MIN_CONTENT_LENGTH_FOR_SUMMARY:
         final_report = "After fetching DuckDuckGo results, no substantial content was extracted to provide a meaningful summary."
         if all_errors_reported:
